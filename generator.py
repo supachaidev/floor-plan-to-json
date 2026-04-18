@@ -110,20 +110,103 @@ def _build_door(
     return _Door(door_id, wall_id, door_type, opening_a, opening_b, hinge, swing_to)
 
 
-def _choose_axis(rng: random.Random, w: int, h: int) -> str | None:
-    """Decide whether to split vertically ('v') or horizontally ('h')."""
-    can_v = w >= 2 * MIN_ROOM_DIM
-    can_h = h >= 2 * MIN_ROOM_DIM
-    if can_v and can_h:
-        # bias toward splitting the longer side, with a little randomness
-        preferred = "v" if w >= h else "h"
-        if rng.random() < 0.25:
-            return "h" if preferred == "v" else "v"
-        return preferred
-    if can_v:
-        return "v"
-    if can_h:
-        return "h"
+def _subtract_forbidden(
+    lo: int, hi: int, forbidden: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Return sub-ranges of [lo, hi] after removing each forbidden (f_lo, f_hi)."""
+    if lo > hi:
+        return []
+    clamped = sorted(
+        (max(f_lo, lo), min(f_hi, hi))
+        for f_lo, f_hi in forbidden
+        if f_hi >= lo and f_lo <= hi
+    )
+    merged: List[List[int]] = []
+    for f_lo, f_hi in clamped:
+        if merged and f_lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], f_hi)
+        else:
+            merged.append([f_lo, f_hi])
+    result: List[Tuple[int, int]] = []
+    cursor = lo
+    for f_lo, f_hi in merged:
+        if f_lo > cursor:
+            result.append((cursor, f_lo - 1))
+        cursor = f_hi + 1
+    if cursor <= hi:
+        result.append((cursor, hi))
+    return [(a, b) for a, b in result if a <= b]
+
+
+def _pick_from_ranges(
+    rng: random.Random, ranges: List[Tuple[int, int]]
+) -> int | None:
+    """Uniform-random draw from the union of [a, b] integer ranges, or None if empty."""
+    if not ranges:
+        return None
+    total = sum(b - a + 1 for a, b in ranges)
+    r = rng.randint(0, total - 1)
+    for a, b in ranges:
+        if r <= b - a:
+            return a + r
+        r -= b - a + 1
+    return None  # unreachable
+
+
+def _doors_on_line(
+    doors: List[_Door], axis: str, value: int
+) -> List[Tuple[int, int]]:
+    """Return door-opening intervals for doors that lie on the given axis-aligned line.
+    axis='x' -> vertical line x=value (returns y-intervals);
+    axis='y' -> horizontal line y=value (returns x-intervals)."""
+    intervals: List[Tuple[int, int]] = []
+    for d in doors:
+        (sx, sy), (ex, ey) = d.start, d.end
+        if axis == "x" and sx == ex == value:
+            intervals.append(tuple(sorted([sy, ey])))
+        elif axis == "y" and sy == ey == value:
+            intervals.append(tuple(sorted([sx, ex])))
+    return intervals
+
+
+def _pick_split_coord(
+    rng: random.Random, rect: Rect, axis: str, doors: List[_Door]
+) -> int | None:
+    """Pick a split coordinate that doesn't place the new wall's endpoints inside
+    any existing door opening along the perpendicular edges of `rect`."""
+    x0, y0, x1, y1 = rect
+    if axis == "v":
+        lo, hi = x0 + MIN_ROOM_DIM, x1 - MIN_ROOM_DIM
+        forbidden = _doors_on_line(doors, "y", y0) + _doors_on_line(doors, "y", y1)
+    else:
+        lo, hi = y0 + MIN_ROOM_DIM, y1 - MIN_ROOM_DIM
+        forbidden = _doors_on_line(doors, "x", x0) + _doors_on_line(doors, "x", x1)
+    return _pick_from_ranges(rng, _subtract_forbidden(lo, hi, forbidden))
+
+
+def _find_split(
+    rng: random.Random, rects: List[Rect], doors: List[_Door]
+) -> Tuple[int, str, int] | None:
+    """Search for a (rect_idx, axis, coord) triple that yields a valid, collision-free split."""
+    for i, r in enumerate(rects):
+        w, h = r[2] - r[0], r[3] - r[1]
+        axes: List[str] = []
+        if w >= 2 * MIN_ROOM_DIM:
+            axes.append("v")
+        if h >= 2 * MIN_ROOM_DIM:
+            axes.append("h")
+        if not axes:
+            continue
+        # Prefer the longer side, with occasional variety.
+        if len(axes) == 2:
+            preferred = "v" if w >= h else "h"
+            if rng.random() < 0.25:
+                preferred = "h" if preferred == "v" else "v"
+            axes = [preferred, "v" if preferred == "h" else "h"]
+        for axis in axes:
+            coord = _pick_split_coord(rng, r, axis, doors)
+            if coord is not None:
+                return i, axis, coord
     return None
 
 
@@ -145,21 +228,16 @@ def _bsp_split(
     next_door = 1   # exterior front door is d0
 
     while len(rects) < num_rooms:
-        # Pick the largest splittable rect.
+        # Largest first, so the biggest rooms get carved up before smaller ones.
         rects.sort(key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True)
-        chosen_idx = None
-        for i, r in enumerate(rects):
-            if _choose_axis(rng, r[2] - r[0], r[3] - r[1]) is not None:
-                chosen_idx = i
-                break
-        if chosen_idx is None:
-            break  # no rect is large enough to subdivide further
-
+        split = _find_split(rng, rects, doors)
+        if split is None:
+            break  # no rect can be subdivided without colliding with an existing door
+        chosen_idx, axis, coord = split
         x0, y0, x1, y1 = rects.pop(chosen_idx)
-        axis = _choose_axis(rng, x1 - x0, y1 - y0)
 
         if axis == "v":
-            split_x = rng.randint(x0 + MIN_ROOM_DIM, x1 - MIN_ROOM_DIM)
+            split_x = coord
             wall = _Wall(
                 id=f"w{next_wall}",
                 type="interior",
@@ -181,7 +259,7 @@ def _bsp_split(
             rects.append((x0, y0, split_x, y1))
             rects.append((split_x, y0, x1, y1))
         else:  # axis == "h"
-            split_y = rng.randint(y0 + MIN_ROOM_DIM, y1 - MIN_ROOM_DIM)
+            split_y = coord
             wall = _Wall(
                 id=f"w{next_wall}",
                 type="interior",
@@ -222,31 +300,68 @@ def _exterior_walls() -> List[_Wall]:
     ]
 
 
-def _exterior_door(rng: random.Random, walls: List[_Wall]) -> _Door:
-    """Cut a single front-door opening into one of the exterior walls (swings inward)."""
-    wall = rng.choice(walls)
-    sx, sy = wall.start
-    ex, ey = wall.end
-    if sy == ey:                                        # horizontal exterior wall
-        a, b = sorted([sx, ex])
-        d_lo = rng.randint(a + DOOR_END_BUFFER + 20, b - DOOR_END_BUFFER - 20 - DOOR_WIDTH)
-        # top wall (y == MARGIN) swings down (+y); bottom wall swings up (-y)
-        inward = "+y" if sy == MARGIN else "-y"
-        return _build_door(
-            rng, "d0", wall.id, "exterior",
-            (d_lo, sy), (d_lo + DOOR_WIDTH, sy),
-            swing_options=[inward],
-        )
-    else:                                               # vertical exterior wall
-        a, b = sorted([sy, ey])
-        d_lo = rng.randint(a + DOOR_END_BUFFER + 20, b - DOOR_END_BUFFER - 20 - DOOR_WIDTH)
-        # left wall (x == MARGIN) swings right (+x); right wall swings left (-x)
-        inward = "+x" if sx == MARGIN else "-x"
-        return _build_door(
-            rng, "d0", wall.id, "exterior",
-            (sx, d_lo), (sx, d_lo + DOOR_WIDTH),
-            swing_options=[inward],
-        )
+def _t_junctions_on_exterior(interior_walls: List[_Wall]) -> Dict[str, List[int]]:
+    """Map each exterior wall id to the coordinates of T-junctions where an
+    interior wall endpoint meets it."""
+    top_y, bot_y = MARGIN, IMG_HEIGHT - MARGIN
+    left_x, right_x = MARGIN, IMG_WIDTH - MARGIN
+    result: Dict[str, List[int]] = {"w0": [], "w1": [], "w2": [], "w3": []}
+    for wall in interior_walls:
+        for (px, py) in (wall.start, wall.end):
+            if py == top_y:
+                result["w0"].append(px)
+            if py == bot_y:
+                result["w2"].append(px)
+            if px == left_x:
+                result["w3"].append(py)
+            if px == right_x:
+                result["w1"].append(py)
+    return result
+
+
+def _exterior_door(
+    rng: random.Random,
+    walls: List[_Wall],
+    t_junctions: Dict[str, List[int]],
+) -> _Door:
+    """Cut a single front-door opening into one of the exterior walls, swinging
+    inward and avoiding any interior-wall T-junction on that exterior wall."""
+    order = list(walls)
+    rng.shuffle(order)
+    for wall in order:
+        sx, sy = wall.start
+        ex, ey = wall.end
+        tj = t_junctions.get(wall.id, [])
+        # The door occupies [d_lo, d_lo + DOOR_WIDTH]; blocking any T-junction
+        # t means d_lo must avoid [t - DOOR_WIDTH, t].
+        forbidden = [(t - DOOR_WIDTH, t) for t in tj]
+        if sy == ey:                                    # horizontal exterior wall
+            a, b = sorted([sx, ex])
+            start_lo = a + DOOR_END_BUFFER + 20
+            start_hi = b - DOOR_END_BUFFER - 20 - DOOR_WIDTH
+            d_lo = _pick_from_ranges(rng, _subtract_forbidden(start_lo, start_hi, forbidden))
+            if d_lo is None:
+                continue
+            inward = "+y" if sy == MARGIN else "-y"
+            return _build_door(
+                rng, "d0", wall.id, "exterior",
+                (d_lo, sy), (d_lo + DOOR_WIDTH, sy),
+                swing_options=[inward],
+            )
+        else:                                           # vertical exterior wall
+            a, b = sorted([sy, ey])
+            start_lo = a + DOOR_END_BUFFER + 20
+            start_hi = b - DOOR_END_BUFFER - 20 - DOOR_WIDTH
+            d_lo = _pick_from_ranges(rng, _subtract_forbidden(start_lo, start_hi, forbidden))
+            if d_lo is None:
+                continue
+            inward = "+x" if sx == MARGIN else "-x"
+            return _build_door(
+                rng, "d0", wall.id, "exterior",
+                (sx, d_lo), (sx, d_lo + DOOR_WIDTH),
+                swing_options=[inward],
+            )
+    raise RuntimeError("No exterior wall has room for a front door without a T-junction collision.")
 
 
 def generate_floor_plan(seed: int | None = None) -> Dict[str, Any]:
@@ -257,7 +372,8 @@ def generate_floor_plan(seed: int | None = None) -> Dict[str, Any]:
     room_rects, interior_walls, interior_doors = _bsp_split(rng, num_rooms)
 
     walls = _exterior_walls() + interior_walls
-    doors = [_exterior_door(rng, _exterior_walls())] + interior_doors
+    t_junctions = _t_junctions_on_exterior(interior_walls)
+    doors = [_exterior_door(rng, _exterior_walls(), t_junctions)] + interior_doors
 
     # Build rooms (use shapely for area / centroid).
     rooms = []
