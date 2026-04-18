@@ -29,12 +29,18 @@ scoring reference.
 
 ---
 
-## Setup
+## Quick start
 
 ```bash
-pip install -r requirements.txt   # opencv-python, shapely, numpy
-pip install matplotlib            # only needed for `view`
+make setup       # install dependencies
+make eval        # score the vectorizer against dataset/
+make demo        # convert sample 000 and render a 3D preview
+make test        # prove the pipeline is raster-only (no GT JSON)
+make help        # list all targets
 ```
+
+Override the sample with `SAMPLE=NNN`, e.g. `make demo SAMPLE=003`.
+Generated artefacts land under `.tmp/`; wipe with `make clean`.
 
 Tested on Python 3.12.
 
@@ -42,7 +48,8 @@ Tested on Python 3.12.
 
 ## CLI
 
-All commands are exposed via `main.py`.
+`make` targets wrap a single Python entry point — all commands are also
+available directly via `main.py`:
 
 ### `evaluate` — measure vectorizer accuracy
 
@@ -115,66 +122,44 @@ invoking the rest of the engine.
 
 ## Testing
 
-Five increasingly-thorough ways to confirm the engine is working:
+Four checks, fastest to most convincing:
 
-**1. Single-sample sanity check** — run the standalone vectorizer:
+**1. Wall + door detection on one sample**
 
 ```bash
 python3 vectorizer.py dataset/floorplan_000.png
 ```
 
-Expect one `[H]` / `[V]` line per wall and one `[D]` line per door.
+Prints one `[H]` / `[V]` line per wall and one `[D]` line per door.
 
-**2. Dataset-wide door counts** — confirm every sample's detected door
-count matches ground truth:
+**2. Wall geometry accuracy across the dataset**
 
 ```bash
-python3 -c "
-import json
-from pathlib import Path
-from vectorizer import vectorize_plan
-for i in range(10):
-    png = Path(f'dataset/floorplan_{i:03d}.png')
-    gt = json.loads(Path(f'dataset/floorplan_{i:03d}.json').read_text())
-    _, d, _ = vectorize_plan(png)
-    ok = 'OK' if len(d) == len(gt['doors']) else 'MISMATCH'
-    print(f'{png.name}  gt_doors={len(gt[\"doors\"])}  pred_doors={len(d)}  {ok}')
-"
+make eval
 ```
 
-On the reference dataset: 10/10 OK.
+Reference dataset: position RMSE 3.4 px, length RMSE 5.7 px (sub-stroke
+accuracy relative to a 6 px wall thickness).
 
-**3. Wall geometry accuracy** — the `evaluate` subcommand reports MSE
-of wall endpoint positions and lengths:
-
-```bash
-python3 main.py evaluate dataset
-```
-
-Reference dataset: position RMSE 3.4 px, length RMSE 5.7 px (sub-stroke).
-
-**4. Visual confirmation** — render each sample and flip through:
+**3. Visual confirmation** — render the converted sample as 3D boxes:
 
 ```bash
-for i in $(seq -w 0 9); do
-  python3 main.py convert dataset/floorplan_00${i}.png -o /tmp/r${i}.json
-  python3 main.py view /tmp/r${i}.json -s /tmp/r${i}.png
-done
+make demo                 # sample 000
+make demo SAMPLE=003      # any other sample
 ```
 
 Expect door-sized red boxes sitting in wall gaps.
 
-**5. Raster-only proof** — verify `convert` does not depend on any
+**4. Raster-only proof** — verify `convert` does not depend on any
 paired ground-truth JSON:
 
 ```bash
-cp dataset/floorplan_000.png /tmp/blind.png       # just the image
-python3 main.py convert /tmp/blind.png -o /tmp/blind_room.json
-python3 -c "import json; r=json.load(open('/tmp/blind_room.json')); \
-  print(f'walls={len(r[\"walls\"])}  doors={len(r[\"doors\"])}')"
+make test
 ```
 
-Expect `walls=6  doors=3` — the doors came entirely from the raster.
+Copies the PNG to `.tmp/blind.png` (no `.json` next to it), runs
+`convert`, and prints the detected wall/door counts. Expect
+`walls=6  doors=3` — all doors came from the raster.
 
 ---
 
@@ -187,6 +172,7 @@ Expect `walls=6  doors=3` — the doors came entirely from the raster.
 | `roomplan_mapper.py`  | 2D walls + doors → RoomPlan `CapturedRoom` JSON                   |
 | `visualize.py`        | 3D box render of a `CapturedRoom`                                 |
 | `main.py`             | CLI (`evaluate`, `convert`, `view`)                               |
+| `Makefile`            | Task runner wrapping every workflow in a one-word target          |
 
 ---
 
