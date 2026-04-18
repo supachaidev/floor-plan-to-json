@@ -16,9 +16,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from vectorizer import Wall, vectorize
+from roomplan_mapper import (
+    DEFAULT_CEILING_M,
+    DEFAULT_PIXELS_PER_METER,
+    build_captured_room,
+)
+from vectorizer import Wall, vectorize, vectorize_plan
 
 
 # --------------------------------------------------------------------------- #
@@ -278,6 +283,50 @@ def evaluate(dataset_dir: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Convert: 2D vectors -> Apple RoomPlan CapturedRoom JSON
+# --------------------------------------------------------------------------- #
+def convert(
+    image_path: Path,
+    out_path: Optional[Path],
+    ceiling_m: float,
+    pixels_per_meter: float,
+) -> None:
+    pred_walls_raw, pred_doors, image_size = vectorize_plan(image_path)
+    pred_walls = [_normalized(w) for w in pred_walls_raw]
+
+    # Re-map door wall_index from the raw wall list to the normalized list.
+    # _normalized reorders endpoints but preserves position, so wall order is
+    # unchanged — the indices stay valid.
+    doors = [
+        {
+            "wall_index": d.wall_index,
+            "start": d.start,
+            "end": d.end,
+        }
+        for d in pred_doors
+    ]
+
+    room = build_captured_room(
+        pred_walls,
+        doors,
+        image_size_px=image_size,
+        ceiling_m=ceiling_m,
+        pixels_per_meter=pixels_per_meter,
+    )
+    serialized = json.dumps(room, indent=2)
+
+    if out_path is None:
+        print(serialized)
+    else:
+        out_path.write_text(serialized)
+        print(
+            f"Wrote {out_path}  "
+            f"({len(room['walls'])} walls, {len(room['doors'])} doors, "
+            f"ceiling={ceiling_m} m, {pixels_per_meter} px/m)"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def _build_parser() -> argparse.ArgumentParser:
@@ -296,6 +345,53 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Directory containing paired *.png and *.json samples.",
     )
+
+    p_conv = sub.add_parser(
+        "convert",
+        help="Vectorize an image and emit Apple RoomPlan CapturedRoom JSON.",
+    )
+    p_conv.add_argument(
+        "image",
+        type=Path,
+        help="Floor-plan PNG to convert (paired .json, if present, supplies doors).",
+    )
+    p_conv.add_argument(
+        "-o", "--output",
+        type=Path,
+        default=None,
+        help="Output JSON path (stdout if omitted).",
+    )
+    p_conv.add_argument(
+        "--ceiling",
+        type=float,
+        default=DEFAULT_CEILING_M,
+        help=f"Ceiling height in meters (default: {DEFAULT_CEILING_M}).",
+    )
+    p_conv.add_argument(
+        "--pixels-per-meter",
+        type=float,
+        default=DEFAULT_PIXELS_PER_METER,
+        help=(
+            f"Pixel-to-meter scale (default: {DEFAULT_PIXELS_PER_METER} px/m "
+            f"-> 1024-px image spans ~{1024 / DEFAULT_PIXELS_PER_METER:.1f} m)."
+        ),
+    )
+
+    p_view = sub.add_parser(
+        "view",
+        help="Render a RoomPlan CapturedRoom JSON as 3D boxes (matplotlib).",
+    )
+    p_view.add_argument(
+        "room_json",
+        type=Path,
+        help="CapturedRoom JSON produced by `convert`.",
+    )
+    p_view.add_argument(
+        "-s", "--save",
+        type=Path,
+        default=None,
+        help="Save to PNG at this path instead of opening an interactive window.",
+    )
     return parser
 
 
@@ -303,6 +399,16 @@ def main() -> None:
     args = _build_parser().parse_args()
     if args.command == "evaluate":
         evaluate(args.dataset)
+    elif args.command == "convert":
+        convert(
+            image_path=args.image,
+            out_path=args.output,
+            ceiling_m=args.ceiling,
+            pixels_per_meter=args.pixels_per_meter,
+        )
+    elif args.command == "view":
+        from visualize import view_room
+        view_room(args.room_json, save_path=args.save)
 
 
 if __name__ == "__main__":
