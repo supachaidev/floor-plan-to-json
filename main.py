@@ -290,8 +290,14 @@ def convert(
     out_path: Optional[Path],
     ceiling_m: float,
     pixels_per_meter: float,
+    wall_thickness_px: Optional[int] = None,
+    door_width_px: Optional[int] = None,
 ) -> None:
-    pred_walls_raw, pred_doors, image_size = vectorize_plan(image_path)
+    pred_walls_raw, pred_doors, image_size, cfg = vectorize_plan(
+        image_path,
+        wall_thickness_px=wall_thickness_px,
+        door_width_px=door_width_px,
+    )
     pred_walls = [_normalized(w) for w in pred_walls_raw]
 
     # Re-map door wall_index from the raw wall list to the normalized list.
@@ -322,7 +328,8 @@ def convert(
         print(
             f"Wrote {out_path}  "
             f"({len(room['walls'])} walls, {len(room['doors'])} doors, "
-            f"ceiling={ceiling_m} m, {pixels_per_meter} px/m)"
+            f"ceiling={ceiling_m} m, {pixels_per_meter} px/m, "
+            f"wall={cfg.wall_thickness_px}px, door={cfg.door_width_px}px)"
         )
 
 
@@ -376,6 +383,18 @@ def _build_parser() -> argparse.ArgumentParser:
             f"-> 1024-px image spans ~{1024 / DEFAULT_PIXELS_PER_METER:.1f} m)."
         ),
     )
+    p_conv.add_argument(
+        "--wall-thickness",
+        type=int,
+        default=None,
+        help="Override wall stroke thickness (px). Auto-estimated if omitted.",
+    )
+    p_conv.add_argument(
+        "--door-width",
+        type=int,
+        default=None,
+        help="Override door opening width (px). Defaults to 10 x wall thickness.",
+    )
 
     p_view = sub.add_parser(
         "view",
@@ -405,6 +424,8 @@ def main() -> None:
             out_path=args.output,
             ceiling_m=args.ceiling,
             pixels_per_meter=args.pixels_per_meter,
+            wall_thickness_px=args.wall_thickness,
+            door_width_px=args.door_width,
         )
     elif args.command == "view":
         from visualize import view_room

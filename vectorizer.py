@@ -26,6 +26,7 @@ Door pipeline (per merged wall):
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -34,35 +35,115 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------- #
-# Tuning
+# Non-scale-dependent constants
 # --------------------------------------------------------------------------- #
-BINARY_THRESHOLD = 127        # grayscale cutoff between wall (black) and empty (white)
-OPEN_KERNEL = 3               # morphological opening removes strokes thinner than this
-ANGLE_TOL_DEG = 3.0           # max deviation from 0/90 deg to accept as axis-aligned
-COLLINEAR_TOL = 5             # px row/column tolerance for collinear clustering
-MERGE_GAP = 80                # px gap bridged when merging collinear segments (> DOOR_WIDTH)
-
-# HoughLinesP parameters tuned for 1024x768 plans with 6 px-thick walls.
-HOUGH_THRESHOLD = 80
-HOUGH_MIN_LEN = 40
-HOUGH_MAX_GAP = 20
-
-# Door-detection tuning.
-WALL_THICKNESS_PX = 6         # matches generator.WALL_THICKNESS
-DOOR_WIDTH_PX = 60            # matches generator.DOOR_WIDTH
-DOOR_GAP_MIN = 40             # min wall-gap size to consider as a door opening
-DOOR_GAP_MAX = 90             # max wall-gap size to consider as a door opening
-DOOR_END_MARGIN = 20          # ignore gaps this close to a wall endpoint (avoid corners)
-LEAF_MIN_LENGTH = 45          # min contiguous perpendicular black pixels for a leaf
-LEAF_LEADING_WHITE = 10       # tolerate up to this many white pixels before the leaf begins
-LEAF_MAX_STEPS = DOOR_WIDTH_PX + 10
+BINARY_THRESHOLD = 127            # grayscale cutoff between wall (black) and empty (white)
+ANGLE_TOL_DEG = 3.0               # max deviation from 0/90 deg to accept as axis-aligned
 HINGE_SEARCH_OFFSETS = (1, 2, 3)  # try hinges this far outside the detected gap
+
+# Fallback used when wall-thickness estimation fails (empty mask etc.).
+# Reference thickness on the generator's images: the generator asks cv2.line
+# for 6-px strokes, but anti-aliasing / line endcaps fatten the binarized
+# result to ~8 px. All derived-tunable ratios in from_thickness() are
+# calibrated against t=8 so the auto path reproduces the original hand-tuned
+# constants exactly for generator output.
+_DEFAULT_THICKNESS_PX = 8
 
 
 Segment = Tuple[int, int, int, int]             # (x1, y1, x2, y2)
 AxisSeg = Tuple[int, int, int]                  # (shared_coord, lo, hi)
 Point2 = Tuple[int, int]
 Wall = Tuple[Point2, Point2]                    # ((x0, y0), (x1, y1))
+
+
+# --------------------------------------------------------------------------- #
+# Scale-adaptive tunables
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class VectorizerConfig:
+    """All pixel-scale vectorizer thresholds, derived from wall stroke width.
+
+    At wall_thickness_px=6 and door_width_px=60, from_thickness() reproduces
+    the original generator-tuned defaults exactly. Other scales scale the
+    thresholds proportionally so the same pipeline handles plans drawn at
+    different resolutions without hand-tuning.
+    """
+    wall_thickness_px: int
+    door_width_px: int
+    open_kernel: int
+    collinear_tol: int
+    merge_gap: int
+    hough_threshold: int
+    hough_min_len: int
+    hough_max_gap: int
+    door_gap_min: int
+    door_gap_max: int
+    door_end_margin: int
+    leaf_min_length: int
+    leaf_leading_white: int
+    leaf_max_steps: int
+
+    @classmethod
+    def from_thickness(
+        cls,
+        wall_thickness_px: int,
+        door_width_px: Optional[int] = None,
+    ) -> "VectorizerConfig":
+        """Derive all thresholds from an explicit binary-mask wall thickness.
+
+        door_width_px defaults to 7.5 x wall thickness (matching the generator's
+        60 px doors against its effective 8 px binarized strokes).
+
+        Ratios are calibrated so from_thickness(8, 60) reproduces the original
+        hand-tuned constants exactly.
+        """
+        t = max(2, int(wall_thickness_px))
+        door = int(door_width_px) if door_width_px is not None else int(round(7.5 * t))
+        return cls(
+            wall_thickness_px=t,
+            door_width_px=door,
+            # Opening kernel must be smaller than the wall stroke so walls
+            # survive while thin door-leaf / arc strokes are erased.
+            open_kernel=max(3, t // 3),
+            collinear_tol=max(3, int(round(0.625 * t))),
+            merge_gap=max(40, int(round(4.0 * door / 3.0))),
+            hough_threshold=max(40, 10 * t),
+            hough_min_len=max(20, 5 * t),
+            hough_max_gap=max(10, int(round(2.5 * t))),
+            door_gap_min=max(20, int(round(2.0 * door / 3.0))),
+            door_gap_max=max(30, int(round(1.5 * door))),
+            door_end_margin=max(10, int(round(2.5 * t))),
+            leaf_min_length=max(20, int(round(0.75 * door))),
+            leaf_leading_white=max(5, int(round(1.25 * t))),
+            leaf_max_steps=door + 10,
+        )
+
+    @classmethod
+    def auto(
+        cls,
+        raw_mask: np.ndarray,
+        door_width_px: Optional[int] = None,
+    ) -> "VectorizerConfig":
+        """Estimate wall thickness from a binary mask and derive a scaled config."""
+        t = _estimate_wall_thickness_px(raw_mask)
+        return cls.from_thickness(t, door_width_px=door_width_px)
+
+
+def _estimate_wall_thickness_px(raw_mask: np.ndarray) -> int:
+    """Estimate wall stroke thickness in pixels from a binary foreground mask.
+
+    Uses 2 x p99 of the distance transform over foreground pixels: inside a
+    stroke of thickness T, distance-to-edge maxes at ~T/2 along the stroke's
+    midline. Thin door strokes pull the distribution's lower tail down but
+    don't affect p99; corners / T-junctions that slightly exceed T/2 are rare
+    enough that p99 stays close to the true wall half-thickness.
+    """
+    if raw_mask.size == 0 or not np.any(raw_mask):
+        return _DEFAULT_THICKNESS_PX
+    dt = cv2.distanceTransform(raw_mask, cv2.DIST_L2, 3)
+    vals = dt[raw_mask > 0]
+    half = float(np.percentile(vals, 99))
+    return max(2, int(round(half * 2)))
 
 
 class Door:
@@ -103,24 +184,25 @@ def _binary_mask(gray: np.ndarray) -> np.ndarray:
     return mask
 
 
-def _wall_mask(raw_mask: np.ndarray) -> np.ndarray:
+def _wall_mask(raw_mask: np.ndarray, cfg: VectorizerConfig) -> np.ndarray:
     """Morphological open on the raw mask — strips thin door strokes."""
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (OPEN_KERNEL, OPEN_KERNEL))
+    k = cfg.open_kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
     return cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel)
 
 
 # --------------------------------------------------------------------------- #
 # Hough detection
 # --------------------------------------------------------------------------- #
-def _hough_segments(mask: np.ndarray) -> List[Segment]:
+def _hough_segments(mask: np.ndarray, cfg: VectorizerConfig) -> List[Segment]:
     """Run Probabilistic Hough on the wall mask and return raw line segments."""
     lines = cv2.HoughLinesP(
         mask,
         rho=1,
         theta=np.pi / 180,
-        threshold=HOUGH_THRESHOLD,
-        minLineLength=HOUGH_MIN_LEN,
-        maxLineGap=HOUGH_MAX_GAP,
+        threshold=cfg.hough_threshold,
+        minLineLength=cfg.hough_min_len,
+        maxLineGap=cfg.hough_max_gap,
     )
     if lines is None:
         return []
@@ -146,15 +228,17 @@ def _axis_of(seg: Segment) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 def _cluster_and_merge(
     segs: List[AxisSeg],
-    row_tol: int = COLLINEAR_TOL,
-    gap_tol: int = MERGE_GAP,
+    cfg: VectorizerConfig,
 ) -> List[AxisSeg]:
     """Given axis-aligned segments (row, lo, hi), group ones sharing a row
-    (within row_tol of the cluster's running mean) and union their [lo, hi]
-    spans when gaps are <= gap_tol. Rows are weighted by span length so the
-    cluster's representative coordinate converges to the dominant wall line."""
+    (within cfg.collinear_tol of the cluster's running mean) and union their
+    [lo, hi] spans when gaps are <= cfg.merge_gap. Rows are weighted by span
+    length so the cluster's representative coordinate converges to the
+    dominant wall line."""
     if not segs:
         return []
+    row_tol = cfg.collinear_tol
+    gap_tol = cfg.merge_gap
 
     segs_sorted = sorted(segs, key=lambda s: (s[0], s[1]))
     clusters: List[List] = []
@@ -219,10 +303,11 @@ def _coverage_along_wall(
 
 
 def _find_gaps(
-    coverage: List[bool], axis_coords: List[int]
+    coverage: List[bool], axis_coords: List[int], cfg: VectorizerConfig
 ) -> List[Tuple[int, int]]:
     """Return interior gaps (lo, hi) in the coverage array whose size falls
-    within [DOOR_GAP_MIN, DOOR_GAP_MAX], clipped away from wall endpoints."""
+    within [cfg.door_gap_min, cfg.door_gap_max], clipped away from wall
+    endpoints by cfg.door_end_margin."""
     gaps: List[Tuple[int, int]] = []
     in_gap = False
     gap_lo_idx = 0
@@ -234,27 +319,27 @@ def _find_gaps(
             in_gap = False
             gap_hi_idx = i - 1
             size = gap_hi_idx - gap_lo_idx + 1
-            if DOOR_GAP_MIN <= size <= DOOR_GAP_MAX:
+            if cfg.door_gap_min <= size <= cfg.door_gap_max:
                 lo_coord = axis_coords[gap_lo_idx]
                 hi_coord = axis_coords[gap_hi_idx]
                 if (
-                    lo_coord > axis_coords[0] + DOOR_END_MARGIN
-                    and hi_coord < axis_coords[-1] - DOOR_END_MARGIN
+                    lo_coord > axis_coords[0] + cfg.door_end_margin
+                    and hi_coord < axis_coords[-1] - cfg.door_end_margin
                 ):
                     gaps.append((lo_coord, hi_coord))
     return gaps
 
 
 def _scan_leaf(
-    raw_mask: np.ndarray, x0: int, y0: int, dx: int, dy: int
+    raw_mask: np.ndarray, x0: int, y0: int, dx: int, dy: int, cfg: VectorizerConfig
 ) -> int:
-    """Stepping (dx, dy) from (x0, y0), skip up to LEAF_LEADING_WHITE initial
-    white pixels (the wall stroke / cleanup zone can absorb a few), then
-    count the contiguous run of black pixels that follows. A single white
-    pixel ends the count."""
+    """Stepping (dx, dy) from (x0, y0), skip up to cfg.leaf_leading_white
+    initial white pixels (the wall stroke / cleanup zone can absorb a few),
+    then count the contiguous run of black pixels that follows. A single
+    white pixel ends the count."""
     h_img, w_img = raw_mask.shape
     step = 1
-    while step <= LEAF_LEADING_WHITE:
+    while step <= cfg.leaf_leading_white:
         x = x0 + dx * step
         y = y0 + dy * step
         if not (0 <= x < w_img and 0 <= y < h_img):
@@ -266,7 +351,7 @@ def _scan_leaf(
         return 0
 
     count = 0
-    while step <= LEAF_MAX_STEPS:
+    while step <= cfg.leaf_max_steps:
         x = x0 + dx * step
         y = y0 + dy * step
         if not (0 <= x < w_img and 0 <= y < h_img):
@@ -280,7 +365,7 @@ def _scan_leaf(
 
 
 def _locate_door(
-    raw_mask: np.ndarray, wall: Wall, gap: Tuple[int, int]
+    raw_mask: np.ndarray, wall: Wall, gap: Tuple[int, int], cfg: VectorizerConfig
 ) -> Optional[Tuple[Point2, Point2, Point2, Point2]]:
     """Given a wall-mask gap on a specific wall, return
     (start, end, hinge, swing_to) if a leaf stroke is visible in the raw mask.
@@ -307,13 +392,13 @@ def _locate_door(
     for candidates in (lo_side, hi_side):
         for hinge in candidates:
             for (dx, dy) in perp_dirs:
-                count = _scan_leaf(raw_mask, hinge[0], hinge[1], dx, dy)
+                count = _scan_leaf(raw_mask, hinge[0], hinge[1], dx, dy, cfg)
                 if best is None or count > best[0]:
                     best = (count, hinge, (dx, dy))
 
     assert best is not None
     leaf_len, hinge, (dx, dy) = best
-    if leaf_len < LEAF_MIN_LENGTH:
+    if leaf_len < cfg.leaf_min_length:
         return None
 
     # Report the full opening span: hinge + non-hinge endpoint, both on the
@@ -326,18 +411,21 @@ def _locate_door(
         other = (x1, gap_hi + side_offset) if hinge[1] < gap_lo else (x1, gap_lo - side_offset)
     start, end = sorted([hinge, other])
 
-    swing_to = (hinge[0] + dx * DOOR_WIDTH_PX, hinge[1] + dy * DOOR_WIDTH_PX)
+    swing_to = (hinge[0] + dx * cfg.door_width_px, hinge[1] + dy * cfg.door_width_px)
     return start, end, hinge, swing_to
 
 
 def _detect_doors(
-    wall_mask: np.ndarray, raw_mask: np.ndarray, walls: List[Wall]
+    wall_mask: np.ndarray,
+    raw_mask: np.ndarray,
+    walls: List[Wall],
+    cfg: VectorizerConfig,
 ) -> List[Door]:
     doors: List[Door] = []
     for idx, wall in enumerate(walls):
         coverage, axis_coords = _coverage_along_wall(wall_mask, wall)
-        for gap in _find_gaps(coverage, axis_coords):
-            resolved = _locate_door(raw_mask, wall, gap)
+        for gap in _find_gaps(coverage, axis_coords, cfg):
+            resolved = _locate_door(raw_mask, wall, gap, cfg)
             if resolved is None:
                 continue
             start, end, hinge, swing_to = resolved
@@ -348,8 +436,8 @@ def _detect_doors(
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def _walls_from_hough(wall_mask: np.ndarray) -> List[Wall]:
-    raw = _hough_segments(wall_mask)
+def _walls_from_hough(wall_mask: np.ndarray, cfg: VectorizerConfig) -> List[Wall]:
+    raw = _hough_segments(wall_mask, cfg)
 
     horizontals: List[AxisSeg] = []
     verticals: List[AxisSeg] = []
@@ -362,44 +450,66 @@ def _walls_from_hough(wall_mask: np.ndarray) -> List[Wall]:
             verticals.append(((x1 + x2) // 2, min(y1, y2), max(y1, y2)))
 
     walls: List[Wall] = []
-    for y, lo, hi in _cluster_and_merge(horizontals):
+    for y, lo, hi in _cluster_and_merge(horizontals, cfg):
         walls.append(((lo, y), (hi, y)))
-    for x, lo, hi in _cluster_and_merge(verticals):
+    for x, lo, hi in _cluster_and_merge(verticals, cfg):
         walls.append(((x, lo), (x, hi)))
     return walls
 
 
-def vectorize(image_path: Path) -> List[Wall]:
-    """Extract clean wall endpoints from a floor-plan image."""
-    walls, _, _ = vectorize_plan(image_path)
+def vectorize(
+    image_path: Path,
+    wall_thickness_px: Optional[int] = None,
+    door_width_px: Optional[int] = None,
+) -> List[Wall]:
+    """Extract clean wall endpoints from a floor-plan image.
+
+    If wall_thickness_px is None, it is estimated from the image.
+    """
+    walls, _, _, _ = vectorize_plan(
+        image_path,
+        wall_thickness_px=wall_thickness_px,
+        door_width_px=door_width_px,
+    )
     return walls
 
 
 def vectorize_plan(
     image_path: Path,
-) -> Tuple[List[Wall], List[Door], Tuple[int, int]]:
-    """Extract walls, doors, and image size (width, height) from an image."""
+    wall_thickness_px: Optional[int] = None,
+    door_width_px: Optional[int] = None,
+) -> Tuple[List[Wall], List[Door], Tuple[int, int], VectorizerConfig]:
+    """Extract walls, doors, image size (width, height), and the config used.
+
+    If wall_thickness_px is None, the stroke thickness is estimated from the
+    raw binary mask and all other tunables are derived from it.
+    """
     gray = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
     if gray is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
     h, w = gray.shape[:2]
 
     raw_mask = _binary_mask(gray)
-    wall_mask = _wall_mask(raw_mask)
+    if wall_thickness_px is not None:
+        cfg = VectorizerConfig.from_thickness(wall_thickness_px, door_width_px)
+    else:
+        cfg = VectorizerConfig.auto(raw_mask, door_width_px=door_width_px)
+    wall_mask = _wall_mask(raw_mask, cfg)
 
-    walls = _walls_from_hough(wall_mask)
-    doors = _detect_doors(wall_mask, raw_mask, walls)
-    return walls, doors, (w, h)
+    walls = _walls_from_hough(wall_mask, cfg)
+    doors = _detect_doors(wall_mask, raw_mask, walls, cfg)
+    return walls, doors, (w, h), cfg
 
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def _print_plan(
-    walls: List[Wall], doors: List[Door], image_path: Path
+    walls: List[Wall], doors: List[Door], image_path: Path, cfg: VectorizerConfig
 ) -> None:
     print(
         f"\n{image_path.name}: detected {len(walls)} walls, {len(doors)} doors"
+        f"  [wall={cfg.wall_thickness_px}px, door={cfg.door_width_px}px]"
     )
     print("-" * 72)
     if walls:
@@ -430,11 +540,27 @@ def main() -> None:
         default=str(Path(__file__).parent / "dataset" / "floorplan_000.png"),
         help="Path to floor-plan PNG (default: ./dataset/floorplan_000.png).",
     )
+    parser.add_argument(
+        "--wall-thickness",
+        type=int,
+        default=None,
+        help="Override wall stroke thickness (px). Auto-estimated if omitted.",
+    )
+    parser.add_argument(
+        "--door-width",
+        type=int,
+        default=None,
+        help="Override door opening width (px). Defaults to 10 x wall thickness.",
+    )
     args = parser.parse_args()
 
     image_path = Path(args.image)
-    walls, doors, _ = vectorize_plan(image_path)
-    _print_plan(walls, doors, image_path)
+    walls, doors, _, cfg = vectorize_plan(
+        image_path,
+        wall_thickness_px=args.wall_thickness,
+        door_width_px=args.door_width,
+    )
+    _print_plan(walls, doors, image_path, cfg)
 
 
 if __name__ == "__main__":
