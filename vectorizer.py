@@ -70,6 +70,7 @@ class VectorizerConfig:
     """
     wall_thickness_px: int
     door_width_px: int
+    close_kernel: int
     open_kernel: int
     collinear_tol: int
     merge_gap: int
@@ -88,24 +89,37 @@ class VectorizerConfig:
         cls,
         wall_thickness_px: int,
         door_width_px: Optional[int] = None,
+        image_width_px: Optional[int] = None,
     ) -> "VectorizerConfig":
         """Derive all thresholds from an explicit binary-mask wall thickness.
 
-        door_width_px defaults to 7.5 x wall thickness (matching the generator's
-        60 px doors against its effective 8 px binarized strokes).
+        door_width_px defaults to max(7.5 x wall thickness, 5% of image width),
+        so larger images get proportionally larger door openings. collinear_tol
+        also gets an image-width floor so that hand-drawn drift on large images
+        (walls meant-to-be-collinear but offset by several px) still merges.
 
-        Ratios are calibrated so from_thickness(8, 60) reproduces the original
-        hand-tuned constants exactly.
+        Ratios are calibrated so from_thickness(8, 60, 1024) reproduces the
+        original hand-tuned constants exactly.
         """
         t = max(2, int(wall_thickness_px))
-        door = int(door_width_px) if door_width_px is not None else int(round(7.5 * t))
+        w = int(image_width_px) if image_width_px is not None else 0
+        if door_width_px is not None:
+            door = int(door_width_px)
+        else:
+            door = max(int(round(7.5 * t)), int(round(0.05 * w)))
+        # Image-width floor on collinear tolerance so large canvases can tolerate
+        # larger absolute drift between intended-collinear hand-drawn segments.
+        collinear = max(int(round(0.625 * t)), int(round(0.004 * w)))
         return cls(
             wall_thickness_px=t,
             door_width_px=door,
+            # Small closing kernel bridges 1-2 px gaps (pen stipple, rendering
+            # holes) without closing real openings like doors or room gaps.
+            close_kernel=3,
             # Opening kernel must be smaller than the wall stroke so walls
             # survive while thin door-leaf / arc strokes are erased.
             open_kernel=max(3, t // 3),
-            collinear_tol=max(3, int(round(0.625 * t))),
+            collinear_tol=max(3, collinear),
             merge_gap=max(40, int(round(4.0 * door / 3.0))),
             hough_threshold=max(40, 10 * t),
             hough_min_len=max(20, 5 * t),
@@ -126,7 +140,12 @@ class VectorizerConfig:
     ) -> "VectorizerConfig":
         """Estimate wall thickness from a binary mask and derive a scaled config."""
         t = _estimate_wall_thickness_px(raw_mask)
-        return cls.from_thickness(t, door_width_px=door_width_px)
+        image_width_px = int(raw_mask.shape[1]) if raw_mask.ndim >= 2 else None
+        return cls.from_thickness(
+            t,
+            door_width_px=door_width_px,
+            image_width_px=image_width_px,
+        )
 
 
 def _estimate_wall_thickness_px(raw_mask: np.ndarray) -> int:
@@ -182,6 +201,22 @@ def _binary_mask(gray: np.ndarray) -> np.ndarray:
     """Raw inverse threshold: 255 where pixel is dark (wall OR door stroke)."""
     _, mask = cv2.threshold(gray, BINARY_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
     return mask
+
+
+def _bridge_mask(raw_mask: np.ndarray, cfg: VectorizerConfig) -> np.ndarray:
+    """Close small axial gaps in the mask (stipple / pen skips / anti-alias
+    holes) while leaving large openings like door gaps untouched.
+
+    Horizontal close then vertical close; 1D kernels so a bridge in one axis
+    doesn't accidentally leak into the perpendicular axis.
+    """
+    k = cfg.close_kernel
+    if k <= 1:
+        return raw_mask
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1))
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k))
+    m = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, hk)
+    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, vk)
 
 
 def _wall_mask(raw_mask: np.ndarray, cfg: VectorizerConfig) -> np.ndarray:
@@ -398,18 +433,29 @@ def _locate_door(
 
     assert best is not None
     leaf_len, hinge, (dx, dy) = best
-    if leaf_len < cfg.leaf_min_length:
-        return None
-
-    # Report the full opening span: hinge + non-hinge endpoint, both on the
-    # wall line. The non-hinge endpoint sits just outside the opposite gap
-    # boundary, matching the hinge's distance from its gap boundary.
     side_offset = HINGE_SEARCH_OFFSETS[0]
-    if orient == "h":
-        other = (gap_hi + side_offset, y) if hinge[0] < gap_lo else (gap_lo - side_offset, y)
+
+    if leaf_len >= cfg.leaf_min_length:
+        # Confident CAD-style: a clear perpendicular leaf is drawn at a hinge
+        # just outside one gap boundary. Use it to orient the opening.
+        if orient == "h":
+            other = (gap_hi + side_offset, y) if hinge[0] < gap_lo else (gap_lo - side_offset, y)
+        else:
+            other = (x1, gap_hi + side_offset) if hinge[1] < gap_lo else (x1, gap_lo - side_offset)
+        start, end = sorted([hinge, other])
     else:
-        other = (x1, gap_hi + side_offset) if hinge[1] < gap_lo else (x1, gap_lo - side_offset)
-    start, end = sorted([hinge, other])
+        # Gap-only fallback: no perpendicular leaf (e.g. hand-drawn arc doors).
+        # Use gap boundaries as the opening span and the gap midpoint as a
+        # nominal hinge; swing_to keeps the best-scoring perpendicular even if
+        # it only saw a stub of ink.
+        if orient == "h":
+            start = (gap_lo - side_offset, y)
+            end = (gap_hi + side_offset, y)
+            hinge = ((gap_lo + gap_hi) // 2, y)
+        else:
+            start = (x1, gap_lo - side_offset)
+            end = (x1, gap_hi + side_offset)
+            hinge = (x1, (gap_lo + gap_hi) // 2)
 
     swing_to = (hinge[0] + dx * cfg.door_width_px, hinge[1] + dy * cfg.door_width_px)
     return start, end, hinge, swing_to
@@ -436,6 +482,41 @@ def _detect_doors(
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+def _filter_stub_walls(walls: List[Wall], cfg: VectorizerConfig) -> List[Wall]:
+    """Drop short perpendicular stubs (door-post flanks, drawing artifacts)
+    whose length is below the expected door width and that have exactly one
+    endpoint touching another wall's line."""
+    if len(walls) < 2:
+        return walls
+    length_threshold = cfg.door_width_px
+    tol = max(cfg.collinear_tol, cfg.wall_thickness_px)
+
+    def _on_wall(px: int, py: int, other: Wall) -> bool:
+        (x1, y1), (x2, y2) = other
+        if y1 == y2:
+            return (
+                abs(py - y1) <= tol
+                and min(x1, x2) - tol <= px <= max(x1, x2) + tol
+            )
+        return (
+            abs(px - x1) <= tol
+            and min(y1, y2) - tol <= py <= max(y1, y2) + tol
+        )
+
+    kept: List[Wall] = []
+    for w in walls:
+        (x1, y1), (x2, y2) = w
+        length = abs(x2 - x1) if y1 == y2 else abs(y2 - y1)
+        if length < length_threshold:
+            others = [o for o in walls if o is not w]
+            p1_on = any(_on_wall(x1, y1, o) for o in others)
+            p2_on = any(_on_wall(x2, y2, o) for o in others)
+            if p1_on != p2_on:
+                continue
+        kept.append(w)
+    return kept
+
+
 def _walls_from_hough(wall_mask: np.ndarray, cfg: VectorizerConfig) -> List[Wall]:
     raw = _hough_segments(wall_mask, cfg)
 
@@ -491,12 +572,19 @@ def vectorize_plan(
 
     raw_mask = _binary_mask(gray)
     if wall_thickness_px is not None:
-        cfg = VectorizerConfig.from_thickness(wall_thickness_px, door_width_px)
+        cfg = VectorizerConfig.from_thickness(
+            wall_thickness_px,
+            door_width_px=door_width_px,
+            image_width_px=w,
+        )
     else:
         cfg = VectorizerConfig.auto(raw_mask, door_width_px=door_width_px)
-    wall_mask = _wall_mask(raw_mask, cfg)
+
+    bridged_mask = _bridge_mask(raw_mask, cfg)
+    wall_mask = _wall_mask(bridged_mask, cfg)
 
     walls = _walls_from_hough(wall_mask, cfg)
+    walls = _filter_stub_walls(walls, cfg)
     doors = _detect_doors(wall_mask, raw_mask, walls, cfg)
     return walls, doors, (w, h), cfg
 
