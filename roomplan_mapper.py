@@ -33,7 +33,10 @@ Each Surface:
 Coordinate conventions:
     - 2D input: +x right, +y down, integer pixels.
     - 3D RoomPlan: +x right, +y up, +z forward (right-handed, y-up).
-    - The 2D image center maps to the world origin; pixel +y maps to world +z.
+    - The 2D image center maps to the world origin; pixel +y maps to world -z,
+      so the top of the source image becomes the "far" side of the room when
+      rendered — matching a standard top-down floor-plan orientation where up
+      on the page is away from the viewer.
     - A wall's local axes are: x = length (width), y = up (height), z = thickness
       (depth). Horizontal 2D walls use identity rotation; vertical 2D walls are
       rotated +90 deg around world-y so their length runs along world-z.
@@ -149,10 +152,12 @@ def _pixel_to_world(
     scale_m_per_px: float,
 ) -> Tuple[float, float]:
     """Recenter pixel coords around the image center, convert to meters.
-    Returns (world_x, world_z). Pixel +y maps to world +z (depth)."""
+    Returns (world_x, world_z). Pixel +y (downward in the image) maps to
+    world -z so the top of the source image renders as the "far" side of
+    the room in a standard 3D view."""
     img_w, img_h = image_size_px
     world_x = (cx_px - img_w / 2.0) * scale_m_per_px
-    world_z = (cy_px - img_h / 2.0) * scale_m_per_px
+    world_z = (img_h / 2.0 - cy_px) * scale_m_per_px
     return world_x, world_z
 
 
